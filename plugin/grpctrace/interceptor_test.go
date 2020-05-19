@@ -378,6 +378,63 @@ func TestStreamClientInterceptor(t *testing.T) {
 	}
 }
 
+func TestStreamClientInterceptor_SendCloseAfterSpanEnd(t *testing.T) {
+	exp := &testExporter{spanMap: make(map[string]*export.SpanData)}
+	tp, _ := sdktrace.NewProvider(sdktrace.WithSyncer(exp),
+		sdktrace.WithConfig(sdktrace.Config{
+			DefaultSampler: sdktrace.AlwaysSample(),
+		},
+		))
+	clientConn, err := grpc.Dial("fake:connection", grpc.WithInsecure())
+	if err != nil {
+		t.Fatalf("failed to create client connection: %v", err)
+	}
+
+	// tracer
+	tracer := tp.Tracer("grpctrace/Server")
+	streamCI := StreamClientInterceptor(tracer)
+
+	var mockClStr mockClientStream
+	methodName := "/github.com.serviceName/bar"
+
+	streamClient, err := streamCI(context.Background(),
+		&grpc.StreamDesc{ServerStreams: true},
+		clientConn,
+		methodName,
+		func(ctx context.Context,
+			desc *grpc.StreamDesc,
+			cc *grpc.ClientConn,
+			method string,
+			opts ...grpc.CallOption) (grpc.ClientStream, error) {
+			mockClStr = mockClientStream{Desc: desc, Ctx: ctx}
+			return mockClStr, nil
+		})
+
+	if err != nil {
+		t.Fatalf("failed to initialize grpc stream client: %v", err)
+	}
+
+	// close client and server stream
+	_ = streamClient.CloseSend()
+	mockClStr.Desc.ServerStreams = false
+	_ = streamClient.RecvMsg(&mockProtoMessage{})
+
+	// added retry because span end is called in separate go routine
+	for retry := 0; retry < 5; retry++ {
+		ok := false
+		exp.mu.Lock()
+		_, ok = exp.spanMap[methodName]
+		exp.mu.Unlock()
+		if ok {
+			break
+		}
+		time.Sleep(time.Second * 1)
+	}
+
+	// panic: send on closed channel
+	_ = streamClient.CloseSend()
+}
+
 func TestServerInterceptorError(t *testing.T) {
 	exp := &testExporter{spanMap: make(map[string]*export.SpanData)}
 	tp, err := sdktrace.NewProvider(
